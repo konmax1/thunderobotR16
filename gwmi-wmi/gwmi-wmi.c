@@ -38,13 +38,33 @@
  *
  * Function 0x0205 has no read counterpart, so the current levels are read
  * back from the EC directly with ec_read().
+ *
+ * The EC firmware runs its own fan curve and rewrites UFA1/UFA2 every few
+ * seconds, so a level written once would survive only 2-5 seconds.  While a
+ * channel is in manual mode a delayed work therefore keeps re-applying the
+ * requested level (unless the EC reports >= 95 C, when full speed is used).
+ * pwm*_enable and pwm* report the requested state, not the EC register.
+ *
+ * The lighting is driven by WMI function 0x0100.  arg0 selects the zone
+ * (0x05 left, 0x04 middle and 0x03 right keyboard zone, 0x06 all keyboard
+ * zones, 0x08 the lid logo on this model), arg1 carries the colour:
+ *
+ *   bits 31:28  animation mode (0 off, 1 static, 2 blink, 3 fade, ...)
+ *   bits 27:24  brightness (0 off, 1 low, 2 high)
+ *   bits 23:16  red, 15:8 green, 7:0 blue
+ *
+ * The EC keeps the colours per zone, but the firmware does not report them
+ * back, so the driver caches the last value written.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/acpi.h>
+#include <linux/bitfield.h>
 #include <linux/device.h>
 #include <linux/hwmon.h>
+#include <linux/led-class-multicolor.h>
+#include <linux/leds.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_profile.h>
@@ -59,6 +79,7 @@
 #define GWMI_OP_SET		0xFB00
 
 /* Functions */
+#define GWMI_FN_LIGHT		0x0100
 #define GWMI_FN_SENSORS		0x0200
 #define GWMI_FN_FAN_LEVEL	0x0205
 #define GWMI_FN_POWER_MODE	0x0300
@@ -75,6 +96,37 @@
 /* EC fan level registers: UFA1, UFA2 (UFA3 lives at 0x3e) */
 #define EC_FAN_LEVEL_BASE	0x2c
 #define EC_FAN_LEVEL3		0x3e
+
+/* EC sensor registers used for the manual-mode safety override */
+#define EC_CPU_TEMP		0x58	/* RTMP */
+#define EC_GPU_TEMP		0xb7	/* VGAT */
+
+/*
+ * The EC firmware re-applies its own fan curve to UFA1/UFA2 every few
+ * seconds, so a manual level written once survives only 2-5 seconds.  While
+ * any channel is in manual mode the driver therefore re-writes the requested
+ * levels once per second.
+ */
+#define GWMI_FAN_HOLD_MS	1000
+#define GWMI_FAN_SAFETY_TEMP	95	/* ignore a low manual level above this */
+
+/* Lighting zones (GWMI_FN_LIGHT, arg0) */
+#define GWMI_LED_KBD_RIGHT	0x03	/* the firmware numbers them right to left */
+#define GWMI_LED_KBD_MIDDLE	0x04
+#define GWMI_LED_KBD_LEFT	0x05
+#define GWMI_LED_LID		0x08	/* lid logo (0x07 on some other models) */
+#define GWMI_LED_COUNT		4
+
+#define GWMI_LED_COLORS		3
+#define GWMI_LED_DEFAULT_MODE	1	/* static */
+#define GWMI_LED_MAX_BRIGHTNESS	2	/* 0 off, 1 low, 2 high */
+
+/* Packed colour word (GWMI_FN_LIGHT, arg1) */
+#define GWMI_LED_MODE		GENMASK(31, 28)
+#define GWMI_LED_BRIGHTNESS	GENMASK(27, 24)
+#define GWMI_LED_RED		GENMASK(23, 16)
+#define GWMI_LED_GREEN		GENMASK(15, 8)
+#define GWMI_LED_BLUE		GENMASK(7, 0)
 
 /* Reply buffer offsets */
 #define GWMI_DAT0		0
@@ -94,12 +146,26 @@ enum gwmi_power_mode {
 	GWMI_MODE_LOW_POWER	= 2,
 };
 
+struct gwmi_wmi_data;
+
+struct gwmi_led {
+	struct gwmi_wmi_data *data;
+	struct led_classdev_mc mc;
+	struct mc_subled subled[GWMI_LED_COLORS];
+	u8 zone;
+	u8 mode;
+	u8 brightness;		/* cached, the LED core value is not reliable */
+	bool configured;
+};
+
 struct gwmi_wmi_data {
 	struct wmi_device *wdev;
 	struct mutex lock;	/* serializes the command/reply pairs */
 	struct mutex fan_lock;	/* protects pwm[] and enable[] */
 	struct device *pp_dev;
 	struct device *hwmon_dev;
+	struct delayed_work fan_hold;
+	struct gwmi_led leds[GWMI_LED_COUNT];
 	u8 pwm[GWMI_FAN_CHANNELS];	/* desired EC fan level */
 	u8 enable[GWMI_FAN_CHANNELS];	/* hwmon pwm*_enable: 0 full, 1 manual, 2 auto */
 	u8 pwm_user[GWMI_FAN_CHANNELS];	/* last pwm*_input value written, 0..255 */
@@ -187,14 +253,20 @@ static int gwmi_set_power_mode(struct gwmi_wmi_data *data, u8 mode)
  */
 
 /* Caller must hold data->fan_lock */
-static int gwmi_write_fan_levels(struct gwmi_wmi_data *data)
+static int gwmi_fan_levels_set(struct gwmi_wmi_data *data, u8 level1, u8 level2)
 {
 	u8 reply[GWMI_BUF_SIZE];
 
+	return gwmi_call(data, GWMI_OP_SET, GWMI_FN_FAN_LEVEL,
+			 level1, level2, GWMI_FAN_AUTO, reply);
+}
+
+/* Caller must hold data->fan_lock */
+static int gwmi_write_fan_levels(struct gwmi_wmi_data *data)
+{
 	lockdep_assert_held(&data->fan_lock);
 
-	return gwmi_call(data, GWMI_OP_SET, GWMI_FN_FAN_LEVEL,
-			 data->pwm[0], data->pwm[1], GWMI_FAN_AUTO, reply);
+	return gwmi_fan_levels_set(data, data->pwm[0], data->pwm[1]);
 }
 
 static int gwmi_read_fan_level(int channel, u8 *level)
@@ -212,17 +284,6 @@ static u8 gwmi_pwm_to_ec(long pwm)
 				 255);
 }
 
-static long gwmi_ec_to_pwm(u8 level)
-{
-	if (level >= GWMI_FAN_MANUAL_MAX)
-		return 255;
-	if (level <= GWMI_FAN_MANUAL_MIN)
-		return 0;
-
-	return DIV_ROUND_CLOSEST((long)(level - GWMI_FAN_MANUAL_MIN) * 255,
-				 GWMI_FAN_MANUAL_MAX - GWMI_FAN_MANUAL_MIN);
-}
-
 static int gwmi_fan_set_auto(struct gwmi_wmi_data *data)
 {
 	int i;
@@ -235,6 +296,60 @@ static int gwmi_fan_set_auto(struct gwmi_wmi_data *data)
 	}
 
 	return gwmi_write_fan_levels(data);
+}
+
+/*
+ * The EC firmware owns UFA1/UFA2 and overwrites them with its own curve
+ * every few seconds.  Re-apply the requested levels while a channel is in
+ * manual mode, and fall back to full speed above GWMI_FAN_SAFETY_TEMP.
+ */
+static void gwmi_fan_hold_work(struct work_struct *work)
+{
+	struct gwmi_wmi_data *data = container_of(to_delayed_work(work),
+						  struct gwmi_wmi_data, fan_hold);
+	u8 want[GWMI_FAN_CHANNELS], level;
+	bool manual = false, hot = false, rewrite = false;
+	int i;
+
+	guard(mutex)(&data->fan_lock);
+
+	for (i = 0; i < GWMI_FAN_CHANNELS; i++)
+		if (data->enable[i] != 2)
+			manual = true;
+
+	if (!manual)
+		return;
+
+	if ((!ec_read(EC_CPU_TEMP, &level) && level >= GWMI_FAN_SAFETY_TEMP) ||
+	    (!ec_read(EC_GPU_TEMP, &level) && level >= GWMI_FAN_SAFETY_TEMP))
+		hot = true;
+
+	for (i = 0; i < GWMI_FAN_CHANNELS; i++) {
+		want[i] = hot && data->enable[i] != 2 ?
+			  GWMI_FAN_MANUAL_MAX : data->pwm[i];
+
+		if (gwmi_read_fan_level(i, &level) || level != want[i])
+			rewrite = true;
+	}
+
+	if (rewrite)
+		gwmi_fan_levels_set(data, want[0], want[1]);
+
+	queue_delayed_work(system_dfl_wq, &data->fan_hold,
+			   msecs_to_jiffies(GWMI_FAN_HOLD_MS));
+}
+
+/* Caller must hold data->fan_lock */
+static void gwmi_fan_hold_start(struct gwmi_wmi_data *data)
+{
+	int i;
+
+	for (i = 0; i < GWMI_FAN_CHANNELS; i++)
+		if (data->enable[i] != 2) {
+			mod_delayed_work(system_dfl_wq, &data->fan_hold,
+					 msecs_to_jiffies(GWMI_FAN_HOLD_MS));
+			return;
+		}
 }
 
 
@@ -349,49 +464,35 @@ static int gwmi_pwm_read(struct gwmi_wmi_data *data, u32 attr, int channel,
 			 long *val)
 {
 	u32 cpu_temp, gpu_temp, fan[GWMI_FAN_CHANNELS];
-	u8 level;
+	u8 mode;
 	int ret;
 
-	ret = gwmi_read_fan_level(channel, &level);
-	if (ret)
-		return ret;
+	guard(mutex)(&data->fan_lock);
+	mode = data->enable[channel];
 
 	if (attr == hwmon_pwm_enable) {
-		if (level == GWMI_FAN_AUTO)
-			*val = 2;
-		else if (level >= GWMI_FAN_FULL)
-			*val = 0;
-		else
-			*val = 1;
-
-		return 0;
-	}
-
-	if (level == GWMI_FAN_AUTO) {
-		/* EC is in charge: report the output estimated from the tach */
-		ret = gwmi_read_sensors(data, &cpu_temp, &gpu_temp,
-					&fan[0], &fan[1]);
-		if (ret)
-			return ret;
-
-		*val = clamp_val(DIV_ROUND_CLOSEST(fan[channel] * 255,
-						   GWMI_FAN_MAX_RPM), 0, 255);
+		*val = mode;
 		return 0;
 	}
 
 	/*
-	 * The EC level has fewer steps than pwm 0..255.  Report the value the
-	 * user wrote while it still matches the EC, so a write reads back
-	 * exactly (monitoring tools verify this).
+	 * Report the requested value, not the EC register: the firmware
+	 * re-applies its own fan curve to UFA1/UFA2 every few seconds, so a
+	 * read-back from the EC would show the EC's level instead of the
+	 * setting the user (or CoolerControl) made.
 	 */
-	scoped_guard(mutex, &data->fan_lock) {
-		if (gwmi_pwm_to_ec(data->pwm_user[channel]) == level) {
-			*val = data->pwm_user[channel];
-			return 0;
-		}
+	if (mode != 2) {
+		*val = mode == 0 ? 255 : data->pwm_user[channel];
+		return 0;
 	}
 
-	*val = gwmi_ec_to_pwm(level);
+	/* EC is in charge: report the output estimated from the tach */
+	ret = gwmi_read_sensors(data, &cpu_temp, &gpu_temp, &fan[0], &fan[1]);
+	if (ret)
+		return ret;
+
+	*val = clamp_val(DIV_ROUND_CLOSEST(fan[channel] * 255,
+					   GWMI_FAN_MAX_RPM), 0, 255);
 
 	return 0;
 }
@@ -445,9 +546,12 @@ static int gwmi_pwm_write(struct gwmi_wmi_data *data, u32 attr, int channel,
 		data->pwm[channel] = old_pwm;
 		data->enable[channel] = old_enable;
 		data->pwm_user[channel] = old_user;
+		return ret;
 	}
 
-	return ret;
+	gwmi_fan_hold_start(data);
+
+	return 0;
 }
 
 static int gwmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
@@ -531,6 +635,231 @@ static const struct hwmon_chip_info gwmi_chip_info = {
 	.info = gwmi_hwmon_info,
 };
 
+/*
+ * Lighting
+ *
+ * Every zone is an LED multicolor class device, so a static colour is set
+ * with the standard multi_intensity attribute:
+ *
+ *   echo 255 0 0 > /sys/class/leds/gwmi_wmi::kbd_backlight-left/multi_intensity
+ *
+ * A shorter form is provided by the rgb attribute ("echo ff0000 > rgb"), and
+ * mode/available_modes expose the animation modes of the firmware.
+ *
+ * The EC stores colour and mode per zone but shares one brightness between
+ * the three keyboard zones, so a brightness change is re-sent for every
+ * keyboard zone with its own cached colour.  The lid zone is independent.
+ * The firmware cannot report the current state, so the driver caches it.
+ */
+
+static const u8 gwmi_led_zones[GWMI_LED_COUNT] = {
+	GWMI_LED_KBD_LEFT, GWMI_LED_KBD_MIDDLE, GWMI_LED_KBD_RIGHT, GWMI_LED_LID,
+};
+
+static const char * const gwmi_led_names[GWMI_LED_COUNT] = {
+	"gwmi_wmi::kbd_backlight-left",
+	"gwmi_wmi::kbd_backlight-middle",
+	"gwmi_wmi::kbd_backlight-right",
+	"gwmi_wmi::lid",
+};
+
+static const char * const gwmi_led_mode_names[] = {
+	"off", "static", "blink", "fade", "heartbeat", "wave", "random",
+	"rainbow",
+};
+
+static bool gwmi_led_is_lid(const struct gwmi_led *led)
+{
+	return led->zone == GWMI_LED_LID;
+}
+
+static int gwmi_led_commit(struct gwmi_led *led)
+{
+	u8 reply[GWMI_BUF_SIZE];
+	u32 arg;
+	int ret;
+
+	arg = FIELD_PREP(GWMI_LED_MODE, led->mode) |
+	      FIELD_PREP(GWMI_LED_BRIGHTNESS, led->brightness) |
+	      FIELD_PREP(GWMI_LED_RED, led->subled[0].intensity) |
+	      FIELD_PREP(GWMI_LED_GREEN, led->subled[1].intensity) |
+	      FIELD_PREP(GWMI_LED_BLUE, led->subled[2].intensity);
+
+	ret = gwmi_call(led->data, GWMI_OP_SET, GWMI_FN_LIGHT, led->zone,
+			arg, 0, reply);
+	if (!ret)
+		led->configured = true;
+
+	return ret;
+}
+
+static int gwmi_led_brightness_set(struct led_classdev *cdev,
+				   enum led_brightness brightness)
+{
+	struct gwmi_led *led = container_of(cdev, struct gwmi_led, mc.led_cdev);
+	struct gwmi_wmi_data *data = led->data;
+	int i, ret;
+
+	/* Colour and mode changes arrive here with an unchanged brightness */
+	if (led->brightness == brightness)
+		return gwmi_led_commit(led);
+
+	for (i = 0; i < GWMI_LED_COUNT; i++) {
+		struct gwmi_led *zone = &data->leds[i];
+
+		if (gwmi_led_is_lid(zone) != gwmi_led_is_lid(led))
+			continue;
+
+		zone->brightness = brightness;
+		ret = gwmi_led_commit(zone);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static enum led_brightness gwmi_led_brightness_get(struct led_classdev *cdev)
+{
+	struct gwmi_led *led = container_of(cdev, struct gwmi_led, mc.led_cdev);
+
+	return led->brightness;
+}
+
+static struct gwmi_led *gwmi_led_from_dev(struct device *dev)
+{
+	return container_of(dev_get_drvdata(dev), struct gwmi_led, mc.led_cdev);
+}
+
+static ssize_t rgb_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct gwmi_led *led = gwmi_led_from_dev(dev);
+
+	return sysfs_emit(buf, "%02x%02x%02x\n", led->subled[0].intensity,
+			  led->subled[1].intensity, led->subled[2].intensity);
+}
+
+static ssize_t rgb_store(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
+{
+	struct gwmi_led *led = gwmi_led_from_dev(dev);
+	unsigned int rgb;
+	int ret;
+
+	ret = kstrtouint(skip_spaces(buf), 16, &rgb);
+	if (ret)
+		return ret;
+	if (rgb > 0xffffff)
+		return -ERANGE;
+
+	led->subled[0].intensity = FIELD_GET(GWMI_LED_RED, rgb);
+	led->subled[1].intensity = FIELD_GET(GWMI_LED_GREEN, rgb);
+	led->subled[2].intensity = FIELD_GET(GWMI_LED_BLUE, rgb);
+
+	ret = gwmi_led_commit(led);
+
+	return ret ? ret : count;
+}
+
+static DEVICE_ATTR_RW(rgb);
+
+static ssize_t mode_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	struct gwmi_led *led = gwmi_led_from_dev(dev);
+
+	return sysfs_emit(buf, "%s\n", gwmi_led_mode_names[led->mode]);
+}
+
+static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct gwmi_led *led = gwmi_led_from_dev(dev);
+	size_t i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(gwmi_led_mode_names); i++) {
+		if (!sysfs_streq(buf, gwmi_led_mode_names[i]))
+			continue;
+
+		led->mode = i;
+		ret = gwmi_led_commit(led);
+
+		return ret ? ret : count;
+	}
+
+	return -EINVAL;
+}
+
+static DEVICE_ATTR_RW(mode);
+
+static ssize_t available_modes_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	int len = 0;
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(gwmi_led_mode_names); i++)
+		len += sysfs_emit_at(buf, len, "%s%s", gwmi_led_mode_names[i],
+				     i + 1 < ARRAY_SIZE(gwmi_led_mode_names) ?
+				     " " : "\n");
+
+	return len;
+}
+
+static DEVICE_ATTR_RO(available_modes);
+
+static struct attribute *gwmi_led_attrs[] = {
+	&dev_attr_rgb.attr,
+	&dev_attr_mode.attr,
+	&dev_attr_available_modes.attr,
+	NULL
+};
+
+static const struct attribute_group gwmi_led_group = {
+	.attrs = gwmi_led_attrs,
+};
+
+static int gwmi_led_register(struct gwmi_wmi_data *data, int index)
+{
+	static const unsigned int color_ids[GWMI_LED_COLORS] = {
+		LED_COLOR_ID_RED, LED_COLOR_ID_GREEN, LED_COLOR_ID_BLUE,
+	};
+	struct gwmi_led *led = &data->leds[index];
+	struct led_classdev *cdev = &led->mc.led_cdev;
+	int i, ret;
+
+	led->data = data;
+	led->zone = gwmi_led_zones[index];
+	led->mode = GWMI_LED_DEFAULT_MODE;
+	/* The first colour write switches the zone on at full brightness */
+	led->brightness = GWMI_LED_MAX_BRIGHTNESS;
+
+	for (i = 0; i < GWMI_LED_COLORS; i++) {
+		led->subled[i].color_index = color_ids[i];
+		led->subled[i].max_intensity = 255;
+		led->subled[i].channel = i;
+	}
+
+	led->mc.num_colors = GWMI_LED_COLORS;
+	led->mc.subled_info = led->subled;
+
+	cdev->name = gwmi_led_names[index];
+	cdev->max_brightness = GWMI_LED_MAX_BRIGHTNESS;
+	cdev->brightness = GWMI_LED_MAX_BRIGHTNESS;
+	cdev->brightness_set_blocking = gwmi_led_brightness_set;
+	cdev->brightness_get = gwmi_led_brightness_get;
+
+	ret = devm_led_classdev_multicolor_register(&data->wdev->dev,
+						    &led->mc);
+	if (ret)
+		return ret;
+
+	/* The LED core does not pass led_cdev->groups through for multicolor */
+	return devm_device_add_group(cdev->dev, &gwmi_led_group);
+}
+
 static int gwmi_wmi_probe(struct wmi_device *wdev, const void *context)
 {
 	struct gwmi_wmi_data *data;
@@ -550,6 +879,8 @@ static int gwmi_wmi_probe(struct wmi_device *wdev, const void *context)
 	ret = devm_mutex_init(&wdev->dev, &data->fan_lock);
 	if (ret)
 		return ret;
+
+	INIT_DELAYED_WORK(&data->fan_hold, gwmi_fan_hold_work);
 
 	dev_set_drvdata(&wdev->dev, data);
 
@@ -601,8 +932,50 @@ static int gwmi_wmi_probe(struct wmi_device *wdev, const void *context)
 		return dev_err_probe(&wdev->dev, PTR_ERR(data->hwmon_dev),
 				     "failed to register hwmon device\n");
 
+	for (i = 0; i < GWMI_LED_COUNT; i++) {
+		ret = gwmi_led_register(data, i);
+		if (ret)
+			return dev_err_probe(&wdev->dev, ret,
+					     "failed to register LED %d\n", i);
+	}
+
 	return 0;
 }
+
+/*
+ * Debug helper: send an arbitrary lighting command ("zone mode brightness
+ * rrggbb", all values hex) so unknown zones and modes can be probed without
+ * reloading the driver.
+ */
+static ssize_t light_raw_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct gwmi_wmi_data *data = dev_get_drvdata(dev);
+	unsigned int zone, mode, brightness, rgb;
+	u8 reply[GWMI_BUF_SIZE];
+	u32 arg;
+	int ret;
+
+	ret = sscanf(buf, "%x %x %x %x", &zone, &mode, &brightness, &rgb);
+	if (ret != 4 || zone > 0xf || mode > 0xf || brightness > 0xf ||
+	    rgb > 0xffffff)
+		return -EINVAL;
+
+	arg = FIELD_PREP(GWMI_LED_MODE, mode) |
+	      FIELD_PREP(GWMI_LED_BRIGHTNESS, brightness) | rgb;
+
+	ret = gwmi_call(data, GWMI_OP_SET, GWMI_FN_LIGHT, zone, arg, 0, reply);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(light_raw);
+
+static struct attribute *gwmi_wmi_attrs[] = {
+	&dev_attr_light_raw.attr,
+	NULL
+};
+
+ATTRIBUTE_GROUPS(gwmi_wmi);
 
 static const struct wmi_device_id gwmi_wmi_id_table[] = {
 	{ GWMI_CONTROL_GUID, NULL },
@@ -614,24 +987,47 @@ static void gwmi_wmi_remove(struct wmi_device *wdev)
 {
 	struct gwmi_wmi_data *data = dev_get_drvdata(&wdev->dev);
 
+	cancel_delayed_work_sync(&data->fan_hold);
 	gwmi_fan_set_auto(data);
+}
+
+static int gwmi_wmi_suspend(struct device *dev)
+{
+	struct gwmi_wmi_data *data = dev_get_drvdata(dev);
+
+	cancel_delayed_work_sync(&data->fan_hold);
+	return 0;
 }
 
 static int gwmi_wmi_resume(struct device *dev)
 {
 	struct gwmi_wmi_data *data = dev_get_drvdata(dev);
+	int i, ret;
 
 	guard(mutex)(&data->fan_lock);
 
-	return gwmi_write_fan_levels(data);
+	ret = gwmi_write_fan_levels(data);
+	if (ret)
+		return ret;
+
+	gwmi_fan_hold_start(data);
+
+	/* the EC forgets the lighting across a suspend */
+	for (i = 0; i < GWMI_LED_COUNT; i++)
+		if (data->leds[i].configured)
+			gwmi_led_commit(&data->leds[i]);
+
+	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(gwmi_wmi_pm_ops, NULL, gwmi_wmi_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(gwmi_wmi_pm_ops, gwmi_wmi_suspend,
+				gwmi_wmi_resume);
 
 static struct wmi_driver gwmi_wmi_driver = {
 	.driver = {
 		.name = DRV_NAME,
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+		.dev_groups = gwmi_wmi_groups,
 		.pm = pm_ptr(&gwmi_wmi_pm_ops),
 	},
 	.id_table = gwmi_wmi_id_table,
@@ -642,5 +1038,5 @@ static struct wmi_driver gwmi_wmi_driver = {
 module_wmi_driver(gwmi_wmi_driver);
 
 MODULE_AUTHOR("mkondratev");
-MODULE_DESCRIPTION("GWMI power profile driver for Bitland/Thunderobot laptops");
+MODULE_DESCRIPTION("GWMI power, fan and keyboard lighting driver for Bitland/Thunderobot laptops");
 MODULE_LICENSE("GPL");

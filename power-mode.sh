@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Управление Thunderobot R16 (Hunter Blade 16): режим производительности
-# и вентиляторы через драйвер gwmi-wmi.
+# Управление Thunderobot R16 (Hunter Blade 16): режим производительности,
+# вентиляторы и подсветка через драйвер gwmi-wmi.
 #
 #   power-mode.sh {0|1|2}              режим питания
 #       0 — максимум:  TGP ~115 Вт + Dynamic Boost (до 140 Вт)
@@ -12,12 +12,19 @@
 #   power-mode.sh fan full             оба на полную скорость
 #   power-mode.sh fan <0-100>          оба вручную, в процентах
 #   power-mode.sh fan <1|2> <auto|full|0-100>   только вентилятор 1 или 2
+#   power-mode.sh light                состояние подсветки
+#   power-mode.sh light <зона> <цвет>  цвет зоны: left|middle|right|lid|kbd|all
+#                                      цвет: RRGGBB или red, green, blue, white,
+#                                      orange, yellow, cyan, magenta, violet, off
+#   power-mode.sh light <зона> bright <0|1|2>   яркость: 0 — выкл, 2 — максимум
+#   power-mode.sh light <зона> mode <режим>     static, off, blink, fade, ...
 #
 # Режим выставляется через platform_profile, которым управляет
 # power-profiles-daemon (то же самое, что переключатель в трее KDE/GNOME).
 # Вентиляторы — через hwmon-устройство gwmi_wmi (pwm1/pwm2).
 # Ручной режим: 0% = самая низкая скорость (~780 об/мин), вентилятор не
 # останавливается; 100% = максимум (~4800 об/мин).
+# Подсветка — через LED-устройства gwmi_wmi (зоны клавиатуры и логотип крышки).
 set -u
 
 usage() {
@@ -140,6 +147,162 @@ cmd_fan() {
     show_fans
 }
 
+# ---- подсветка ----
+
+LED_ROOT=/sys/class/leds
+LED_ZONES="left middle right lid"
+LED_MODES="off static blink fade heartbeat wave random rainbow"
+
+# led_dir <зона> — каталог LED-устройства зоны
+led_dir() {
+    case "$1" in
+        lid) echo "$LED_ROOT/gwmi_wmi::lid" ;;
+        left|middle|right) echo "$LED_ROOT/gwmi_wmi::kbd_backlight-$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+led_zones_expand() {
+    case "$1" in
+        left|middle|right|lid) echo "$1" ;;
+        kbd) echo "left middle right" ;;
+        all) echo "$LED_ZONES" ;;
+        *) return 1 ;;
+    esac
+}
+
+color_code() {
+    case "$1" in
+        red) echo ff0000 ;;
+        green) echo 00ff00 ;;
+        blue) echo 0000ff ;;
+        white) echo ffffff ;;
+        yellow) echo ffff00 ;;
+        orange) echo ff8000 ;;
+        cyan) echo 00ffff ;;
+        magenta|purple) echo ff00ff ;;
+        violet) echo 8000ff ;;
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])
+            echo "$1" | tr 'A-F' 'a-f' ;;
+        *) return 1 ;;
+    esac
+}
+
+valid_led_mode() {
+    case " $LED_MODES " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
+
+show_light() {
+    local z d found=0
+    echo "подсветка:"
+    for z in $LED_ZONES; do
+        d=$(led_dir "$z")
+        [ -e "$d/rgb" ] || continue
+        found=1
+        printf '  %-6s цвет: %s, яркость: %s/2, режим: %s\n' "$z" \
+            "$(cat "$d/rgb" 2>/dev/null)" \
+            "$(cat "$d/brightness" 2>/dev/null)" \
+            "$(cat "$d/mode" 2>/dev/null)"
+    done
+    [ "$found" -eq 1 ] || {
+        echo "  LED-устройства gwmi_wmi не найдены — модуль gwmi_wmi загружен?"
+        return 1
+    }
+}
+
+# light_color <зона> <RRGGBB|off>
+light_color() {
+    local d
+    d=$(led_dir "$1") || return 1
+    if [ "$2" = off ]; then
+        echo off > "$d/mode"
+    else
+        echo static > "$d/mode"   # из анимации обратно в статичный цвет
+        echo "$2" > "$d/rgb"
+    fi
+}
+
+light_brightness() {
+    local d
+    d=$(led_dir "$1") || return 1
+    echo "$2" > "$d/brightness"
+}
+
+light_mode() {
+    local d
+    d=$(led_dir "$1") || return 1
+    echo "$2" > "$d/mode"
+}
+
+cmd_light() {
+    local zs z val kbd_done=0
+    if [ $# -eq 0 ]; then
+        show_light
+        return
+    fi
+
+    zs=$(led_zones_expand "$1") || {
+        echo "ошибка: зона должна быть left, middle, right, lid, kbd или all"
+        exit 1
+    }
+    [ $# -ge 2 ] || usage
+
+    case "$2" in
+        bright)
+            [ $# -eq 3 ] || usage
+            val=$3
+            case "$val" in
+                0|1|2) ;;
+                *) echo "ошибка: яркость должна быть 0, 1 или 2"; exit 1 ;;
+            esac
+            # яркость трёх зон клавиатуры общая — пишем её один раз
+            for z in $zs; do
+                case "$z" in
+                    lid)
+                        light_brightness lid "$val" || exit 1
+                        ;;
+                    *)
+                        [ "$kbd_done" -eq 1 ] && continue
+                        kbd_done=1
+                        light_brightness "$z" "$val" || exit 1
+                        ;;
+                esac
+            done
+            ;;
+        mode)
+            [ $# -eq 3 ] || usage
+            val=$3
+            valid_led_mode "$val" || {
+                echo "ошибка: режим должен быть одним из: $LED_MODES"
+                exit 1
+            }
+            for z in $zs; do
+                light_mode "$z" "$val" || exit 1
+            done
+            ;;
+        *)
+            [ $# -eq 2 ] || usage
+            if [ "$2" != off ]; then
+                val=$(color_code "$2") || {
+                    echo "ошибка: цвет — RRGGBB или red, green, blue, white, orange, yellow,"
+                    echo "        cyan, magenta, violet; off — выключить"
+                    exit 1
+                }
+            else
+                val=off
+            fi
+            for z in $zs; do
+                light_color "$z" "$val" || exit 1
+            done
+            ;;
+    esac
+
+    show_light
+}
+
 CMD=${1:-}
 case "$CMD" in
     0|1|2)
@@ -155,6 +318,12 @@ case "$CMD" in
         # без аргументов — только чтение, root не нужен
         [ $# -eq 0 ] || need_root fan "$@"
         cmd_fan "$@"
+        ;;
+    light)
+        shift
+        # без аргументов — только чтение, root не нужен
+        [ $# -eq 0 ] || need_root light "$@"
+        cmd_light "$@"
         ;;
     *)
         usage
