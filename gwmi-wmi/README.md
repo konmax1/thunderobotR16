@@ -1,14 +1,15 @@
-# gwmi-wmi — режимы производительности и вентиляторы Thunderobot R16 (Bitland)
+# gwmi-wmi — режимы производительности, вентиляторы и подсветка Thunderobot R16 (Bitland)
 
 Драйвер для ACPI-WMI интерфейса `GWMI`, который использует фирменная утилита
 Thunderobot Control Center. Даёт Linux-эквивалент переключателя
-«Офис / Игра / Максимум», управляет лимитом мощности GPU и позволяет
-задавать скорость вентиляторов.
+«Офис / Игра / Максимум», управляет лимитом мощности GPU, позволяет
+задавать скорость вентиляторов и цвет подсветки клавиатуры и логотипа на
+крышке.
 
 ## Что делает
 
-Регистрирует `platform_profile` с тремя профилями и hwmon с датчиками и
-управлением вентиляторами.
+Регистрирует `platform_profile` с тремя профилями, hwmon с датчиками и
+управлением вентиляторами и четыре LED-устройства для подсветки.
 
 | Профиль | Режим EC (`APMD`, 0x95) | TGP GPU |
 |---|---|---|
@@ -37,7 +38,21 @@ Thunderobot Control Center. Даёт Linux-эквивалент переключ
 ./power-mode.sh fan 60              # оба вручную, 60 %
 ./power-mode.sh fan 1 40            # только вентилятор 1 (CPU), 40 %
 ./power-mode.sh fan 2 auto          # только вентилятор 2 вернуть в auto
+
+./power-mode.sh light                    # состояние подсветки (без root)
+./power-mode.sh light lid red            # логотип крышки — красный
+./power-mode.sh light left 00ff00        # левая треть — зелёный (RRGGBB)
+./power-mode.sh light right blue         # правая треть — синий
+./power-mode.sh light kbd white          # вся клавиатура (left+middle+right)
+./power-mode.sh light all off            # погасить всё
+./power-mode.sh light lid bright 1       # яркость 0 — выкл, 1 — низкая, 2 — макс.
+./power-mode.sh light kbd mode fade      # анимация (проверены static и off)
 ```
+
+Зоны: `left`, `middle`, `right`, `lid`, `kbd` (три зоны клавиатуры), `all`.
+Цвета: `RRGGBB` или `red`, `green`, `blue`, `white`, `yellow`, `orange`,
+`cyan`, `magenta`, `violet`. Яркость трёх зон клавиатуры общая, у логотипа
+крышки — своя.
 
 Проценты 0–100 пересчитываются в `pwm` 0–255. В ручном режиме 0 % — самая
 низкая скорость (~780 об/мин), вентилятор не останавливается; 100 % — максимум
@@ -64,6 +79,11 @@ pwm1_enable, pwm2_enable   0 — полная скорость, 1 — ручно
 - Чтение `pwm*` в авто-режиме возвращает оценку по оборотам
   (`rpm × 255 / 4820`), а не «всегда 255».
 - Состояние защищено мьютексом; при ошибке записи в EC кэш откатывается.
+- Прошивка EC раз в 2–5 секунд возвращает свои уровни в UFA1/UFA2, поэтому,
+  пока включён ручной режим, драйвер переписывает заданный уровень каждую
+  секунду. Без этого внешнее управление (CoolerControl) не работало бы.
+- При 95 °C и выше по датчикам EC ручной уровень игнорируется и включается
+  полная скорость.
 - Вручную заданные уровни восстанавливаются после сна. Если драйвер
   загружается, а в EC остался ручной уровень (например, после сбоя), он
   сбрасывается в авто. При выгрузке модуля вентиляторы тоже возвращаются в авто.
@@ -98,6 +118,56 @@ echo 2   | sudo tee /sys/class/hwmon/hwmonN/pwm1_enable   # вернуть ав�
 journalctl -u coolercontrold | grep gwmi_wmi
 ```
 
+## Подсветка
+
+Драйвер создаёт четыре LED-устройства (multicolor) — по одному на зону:
+
+| Устройство | Зона |
+|---|---|
+| `/sys/class/leds/gwmi_wmi::kbd_backlight-left` | левая треть клавиатуры |
+| `/sys/class/leds/gwmi_wmi::kbd_backlight-middle` | средняя треть клавиатуры |
+| `/sys/class/leds/gwmi_wmi::kbd_backlight-right` | правая треть клавиатуры |
+| `/sys/class/leds/gwmi_wmi::lid` | логотип на крышке |
+
+Статичный цвет задаётся стандартным атрибутом `multi_intensity` (R G B,
+0–255) или коротким `rgb` (шестизначный hex):
+
+```
+echo 255 0 0 | sudo tee /sys/class/leds/gwmi_wmi::kbd_backlight-left/multi_intensity
+echo 0000ff  | sudo tee /sys/class/leds/gwmi_wmi::kbd_backlight-right/rgb
+echo ff8000  | sudo tee /sys/class/leds/gwmi_wmi::lid/rgb
+```
+
+Яркость — `brightness` (0 — выкл, 1 — низкая, 2 — высокая). У трёх зон
+клавиатуры она общая: так устроена прошивка, драйвер сам переписывает все
+три зоны при изменении. У крышки яркость своя.
+
+```
+echo 1 | sudo tee /sys/class/leds/gwmi_wmi::kbd_backlight-left/brightness
+```
+
+Режим — `mode`, по умолчанию `static`. Доступные значения:
+`off static blink fade heartbeat wave random rainbow`
+(список также в `available_modes`). Проверены `static` и `off`; в
+анимированных режимах прошивка, скорее всего, игнорирует заданный цвет.
+
+```
+cat  /sys/class/leds/gwmi_wmi::lid/available_modes
+echo fade | sudo tee /sys/class/leds/gwmi_wmi::lid/mode
+```
+
+Прошивка не умеет читать состояние подсветки, поэтому драйвер помнит
+последние записанные значения и повторяет их после выхода из сна. После
+перезагрузки подсветка возвращается к заводскому поведению — цвета нужно
+задать заново (например, скриптом при входе в систему).
+
+Для экспериментов у WMI-устройства есть отладочный атрибут `light_raw`
+(формат: `зона режим яркость rrggbb`, всё в hex):
+
+```
+echo "8 1 2 ff0000" | sudo tee /sys/bus/wmi/devices/644C5791-B7B0-4123-A90B-E93876E0DAAD/light_raw
+```
+
 ## Протокол
 
 Legacy WMI data block `644C5791-B7B0-4123-A90B-E93876E0DAAD`
@@ -105,8 +175,8 @@ Legacy WMI data block `644C5791-B7B0-4123-A90B-E93876E0DAAD`
 
 ```
 [0..1]   команда: 0xFA00 — чтение, 0xFB00 — запись
-[2..3]   функция: 0x0200 — датчики, 0x0205 — уровни вентиляторов,
-                  0x0300 — режим питания
+[2..3]   функция: 0x0100 — подсветка, 0x0200 — датчики,
+                  0x0205 — уровни вентиляторов, 0x0300 — режим питания
 [4..7]   аргумент 0
 [8..11]  аргумент 1
 [12..15] аргумент 2
@@ -121,6 +191,10 @@ Legacy WMI data block `644C5791-B7B0-4123-A90B-E93876E0DAAD`
   (аргументы 0/1/2, регистры EC `0x2C`/`0x2D`/`0x3E`). UFA3 драйвер всегда
   держит в auto. Чтения у функции нет, поэтому текущие уровни читаются прямо из
   EC через `ec_read()`.
+- Функция `0x0100` управляет подсветкой: аргумент 0 — зона (`0x03`/`0x04`/`0x05`
+  — правая/средняя/левая зона клавиатуры, `0x06` — все зоны клавиатуры,
+  `0x08` — логотип на крышке), аргумент 1 — упакованный цвет: биты 31:28 —
+  режим (1 — статичный), 27:24 — яркость (0–2), 23:16 — R, 15:8 — G, 7:0 — B.
 
 Уровень вентилятора в EC — это не процент заполнения:
 
@@ -134,25 +208,25 @@ Legacy WMI data block `644C5791-B7B0-4123-A90B-E93876E0DAAD`
 ## Установка
 
 ```
-sudo dkms add -m gwmi-wmi -v 1.2
-sudo dkms build -m gwmi-wmi -v 1.2
-sudo dkms install -m gwmi-wmi -v 1.2 --force
+sudo dkms add -m gwmi-wmi -v 1.4
+sudo dkms build -m gwmi-wmi -v 1.4
+sudo dkms install -m gwmi-wmi -v 1.4 --force
 sudo depmod -a
 echo gwmi-wmi | sudo tee /etc/modules-load.d/gwmi-wmi.conf
 ```
 
-Исходники должны лежать в `/usr/src/gwmi-wmi-1.2` вместе с `dkms.conf` и
+Исходники должны лежать в `/usr/src/gwmi-wmi-1.4` вместе с `dkms.conf` и
 `Makefile`. Модуль собирается автоматически при обновлении ядра (DKMS).
 После изменения исходников пересоберите модуль той же последовательностью
-(`dkms remove -m gwmi-wmi -v 1.2 --all`, затем `add`/`build`/`install`) и
+(`dkms remove -m gwmi-wmi -v 1.4 --all`, затем `add`/`build`/`install`) и
 перезагрузите: `sudo modprobe -r gwmi_wmi && sudo modprobe gwmi_wmi`.
 
-### Обновление с 1.1
+### Обновление с более ранних версий
 
 ```
-sudo dkms remove -m gwmi-wmi -v 1.1 --all
-sudo rm -rf /usr/src/gwmi-wmi-1.1
-sudo cp -r gwmi-wmi-1.2 /usr/src/    # gwmi-wmi.c, Makefile, dkms.conf
+sudo dkms remove -m gwmi-wmi -v <старая> --all
+sudo rm -rf /usr/src/gwmi-wmi-<старая>
+sudo cp -r gwmi-wmi-1.4 /usr/src/    # gwmi-wmi.c, Makefile, dkms.conf
 ```
 
 Затем выполните команды `dkms add/build/install` из раздела «Установка».
@@ -161,8 +235,8 @@ sudo cp -r gwmi-wmi-1.2 /usr/src/    # gwmi-wmi.c, Makefile, dkms.conf
 
 ```
 sudo rm /etc/modules-load.d/gwmi-wmi.conf
-sudo dkms remove -m gwmi-wmi -v 1.2 --all
-sudo rm -rf /usr/src/gwmi-wmi-1.2
+sudo dkms remove -m gwmi-wmi -v 1.4 --all
+sudo rm -rf /usr/src/gwmi-wmi-1.4
 sudo modprobe -r gwmi_wmi
 echo balanced | sudo tee /sys/firmware/acpi/platform_profile
 ```
@@ -177,4 +251,9 @@ echo balanced | sudo tee /sys/firmware/acpi/platform_profile
   эмпирически; на другой ревизии прошивки могут отличаться.
 - Драйвер не обрабатывает WMI-события (`74286D6E-...`) — горячие клавиши
   вентиляторов/подсветки не затрагиваются.
+- Нумерация зон подсветки и коды режимов определены на этом ноутбуке. У других
+  моделей Bitland/Casper они отличаются (например, логотип там — зона `0x07`);
+  для проверки используйте `light_raw`.
+- Анимированные режимы (`blink`, `fade`, …) прошивка может понимать по-своему;
+  назначение режимов проверено только для `static` и `off`.
 - Режим питания после сна драйвер не восстанавливает — это делает EC/прошивка.
