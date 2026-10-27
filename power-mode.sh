@@ -2,7 +2,7 @@
 # Управление Thunderobot R16 (Hunter Blade 16): режим производительности,
 # вентиляторы и подсветка через драйвер gwmi-wmi.
 #
-#   power-mode.sh {0|1|2}              режим питания
+#   power-mode.sh power {0|1|2}        режим питания
 #       0 — максимум:  TGP ~115 Вт + Dynamic Boost (до 140 Вт)
 #       1 — сбалансированный (заводской): ~95 Вт
 #       2 — энергосбережение: ~80 Вт
@@ -47,8 +47,33 @@ find_hwmon() {
     return 1
 }
 
+# show_cpu_power — лимиты пакета CPU из RAPL (PL1 — long_term, PL2 — short_term)
+show_cpu_power() {
+    local b=/sys/class/powercap/intel-rapl:0 pl1 pl2
+    [ -r "$b/constraint_0_power_limit_uw" ] || return 0
+    pl1=$(cat "$b/constraint_0_power_limit_uw" 2>/dev/null) || return 0
+    pl2=$(cat "$b/constraint_1_power_limit_uw" 2>/dev/null) || pl2=
+    case "$pl1" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    printf 'CPU: PL1 %s Вт' "$((pl1 / 1000000))"
+    case "$pl2" in
+        ''|*[!0-9]*) ;;
+        *) printf ', PL2 %s Вт' "$((pl2 / 1000000))" ;;
+    esac
+    echo
+}
+
+# show_profile [задержка] — профиль, лимиты CPU и GPU
+# (задержка нужна после смены режима: nvidia-smi показывает лимит с запозданием)
 show_profile() {
+    local wait=${1:-0}
     echo "режим: $(cat /sys/firmware/acpi/platform_profile 2>/dev/null || echo недоступен)"
+    if [ "$wait" -gt 0 ]; then
+        echo "ждём ${wait} с, пока GPU применит новый лимит..."
+        sleep "$wait"
+    fi
+    show_cpu_power
     if command -v nvidia-smi >/dev/null 2>&1; then
         nvidia-smi -q -d POWER 2>/dev/null \
             | grep -E "Current Power Limit|Default Power Limit" | sed 's/^ *//'
@@ -61,6 +86,7 @@ set_profile() {
         0) profile=performance ;;
         1) profile=balanced ;;
         2) profile=power-saver ;;
+        *) echo "ошибка: режим должен быть 0, 1 или 2"; exit 1 ;;
     esac
     if command -v powerprofilesctl >/dev/null 2>&1 && powerprofilesctl list >/dev/null 2>&1; then
         powerprofilesctl set "$profile"
@@ -69,7 +95,7 @@ set_profile() {
         [ "$profile" = power-saver ] && profile=low-power
         echo "$profile" > /sys/firmware/acpi/platform_profile
     fi
-    show_profile
+    show_profile 5
 }
 
 show_fans() {
@@ -305,9 +331,15 @@ cmd_light() {
 
 CMD=${1:-}
 case "$CMD" in
-    0|1|2)
-        need_root "$@"
-        set_profile "$CMD"
+    power)
+        shift
+        [ $# -eq 1 ] || usage
+        case "$1" in
+            0|1|2) ;;
+            *) usage ;;
+        esac
+        need_root power "$@"
+        set_profile "$1"
         ;;
     status)
         show_profile

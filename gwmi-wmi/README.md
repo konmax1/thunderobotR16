@@ -27,9 +27,9 @@ Thunderobot Control Center. Даёт Linux-эквивалент переключ
 Команды, меняющие состояние, сами запрашивают root через `sudo`.
 
 ```
-./power-mode.sh 0          # максимум
-./power-mode.sh 1          # баланс
-./power-mode.sh 2          # экономия
+./power-mode.sh power 0    # максимум
+./power-mode.sh power 1    # баланс
+./power-mode.sh power 2    # экономия
 ./power-mode.sh status     # профиль, лимиты GPU, вентиляторы, температуры
 
 ./power-mode.sh fan                 # состояние вентиляторов (без root)
